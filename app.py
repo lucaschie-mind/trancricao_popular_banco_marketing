@@ -141,6 +141,42 @@ hr { border-color: #2a2a35 !important; }
 """, unsafe_allow_html=True)
 
 
+# ── ffmpeg path resolution ────────────────────────────────────────────────────
+def get_ffmpeg_path() -> str:
+    """
+    Returns the ffmpeg binary path.
+    Priority: system ffmpeg → imageio-ffmpeg bundled binary.
+    """
+    import shutil
+    system_ff = shutil.which("ffmpeg")
+    if system_ff:
+        return system_ff
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        pass
+    raise RuntimeError(
+        "ffmpeg não encontrado. Instale ffmpeg no sistema ou adicione "
+        "'imageio-ffmpeg' ao requirements.txt."
+    )
+
+def get_ffprobe_path() -> str:
+    """Returns ffprobe path (system only — imageio-ffmpeg doesn't bundle it)."""
+    import shutil
+    p = shutil.which("ffprobe")
+    if p:
+        return p
+    # ffprobe is usually alongside ffmpeg; try same directory
+    import os
+    ff = shutil.which("ffmpeg")
+    if ff:
+        candidate = os.path.join(os.path.dirname(ff), "ffprobe")
+        if os.path.isfile(candidate):
+            return candidate
+    raise RuntimeError("ffprobe não encontrado no sistema.")
+
+
 # ── Secret helper ─────────────────────────────────────────────────────────────
 def get_secret(key: str) -> str | None:
     """Read from st.secrets (local) or os.environ (Railway/cloud), whichever exists."""
@@ -230,7 +266,7 @@ def get_audio_duration(path: str) -> float:
     """Return total duration in seconds via ffprobe."""
     result = subprocess.run(
         [
-            "ffprobe", "-v", "error",
+            get_ffprobe_path(), "-v", "error",
             "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1",
             path,
@@ -247,7 +283,7 @@ def extract_audio_segment(input_path: str, output_path: str,
     These settings are transparent for speech: Whisper was trained at 16 kHz
     and mono channels carry all voice information.
     """
-    cmd = ["ffmpeg", "-y", "-ss", str(start_sec)]
+    cmd = [get_ffmpeg_path(), "-y", "-ss", str(start_sec)]
     if duration_sec is not None:
         cmd += ["-t", str(duration_sec)]
     cmd += [
