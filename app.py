@@ -133,6 +133,18 @@ hr { border-color: #2a2a35 !important; }
 """, unsafe_allow_html=True)
 
 
+# ── Secret helper ─────────────────────────────────────────────────────────────
+def get_secret(key: str) -> str | None:
+    """Read from st.secrets (local) or os.environ (Railway/cloud), whichever exists."""
+    try:
+        val = st.secrets.get(key, None)
+        if val:
+            return val
+    except Exception:
+        pass
+    return os.environ.get(key, None)
+
+
 # ── Constants ──────────────────────────────────────────────────────────────────
 CHUNK_LIMIT_MB    = 23          # OpenAI limit is 25 MB; keep margin
 AUDIO_BITRATE     = "64k"       # mono mp3 64kbps — perfect for speech
@@ -159,9 +171,9 @@ def get_drive_service():
         from google.oauth2 import service_account
         from googleapiclient.discovery import build
 
-        creds_json = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON", None)
+        creds_json = get_secret("GOOGLE_SERVICE_ACCOUNT_JSON")
         if not creds_json:
-            return None, "Credencial `GOOGLE_SERVICE_ACCOUNT_JSON` não encontrada nos secrets."
+            return None, "Credencial `GOOGLE_SERVICE_ACCOUNT_JSON` não encontrada nos secrets nem nas variáveis de ambiente."
 
         creds_info = json.loads(creds_json) if isinstance(creds_json, str) else dict(creds_json)
         scopes = ["https://www.googleapis.com/auth/drive"]
@@ -245,9 +257,9 @@ def transcribe_chunk_api(audio_path: str, language: str | None, client) -> str:
 def build_openai_client():
     try:
         from openai import OpenAI
-        api_key = st.secrets.get("OPENAI_API_KEY", None)
+        api_key = get_secret("OPENAI_API_KEY")
         if not api_key:
-            return None, "Chave `OPENAI_API_KEY` não encontrada nos secrets."
+            return None, "Chave `OPENAI_API_KEY` não encontrada nos secrets nem nas variáveis de ambiente."
         return OpenAI(api_key=api_key), None
     except ImportError:
         return None, "Pacote `openai` não instalado. Rode: pip install openai"
@@ -524,22 +536,19 @@ if transcription_result:
     elif not drive_url:
         st.info("Informe o link da pasta raiz do Drive para habilitar o salvamento.")
 
+    # ── SECTION 5: Indexação no banco vetorial ─────────────────────────────────
+    st.divider()
+    st.subheader("🧠 Indexação no Banco Vetorial")
 
-# ── SECTION 5: Indexação no banco vetorial ─────────────────────────────────────
+    db_url = get_secret("DATABASE_URL")
 
-st.divider()
-st.subheader("🧠 Indexação no Banco Vetorial")
-
-# Verifica se DATABASE_URL está configurada
-db_url = st.secrets.get("DATABASE_URL", None)
-
-if not db_url:
-    st.markdown(
-        '<div class="status-box status-warning">⚠️ <strong>DATABASE_URL</strong> não encontrada nos secrets. '
-        'Configure para habilitar a indexação.</div>',
-        unsafe_allow_html=True,
-    )
-else:
+    if not db_url:
+        st.markdown(
+            '<div class="status-box status-warning">⚠️ <strong>DATABASE_URL</strong> não encontrada. '
+            'Configure a variável de ambiente para habilitar a indexação.</div>',
+            unsafe_allow_html=True,
+        )
+    else:
     import hashlib
     import time as _time
 
@@ -696,7 +705,11 @@ else:
         conn.close()
         return total_chunks
 
-    # ── UI da seção ────────────────────────────────────────────────────────────
+    # ── UI da seção — só aparece se já há transcrição ou usuário quer reindexar tudo ──
+    if not transcription_result:
+        st.info("Faça uma transcrição primeiro para habilitar a indexação.")
+        st.stop()
+
     index_mode = st.radio(
         "Modo de indexação",
         options=[
@@ -707,11 +720,6 @@ else:
         help="Opção 1 zera a tabela `documentos` e reindexa todos os arquivos da pasta raiz do Drive. "
              "Opção 2 insere apenas o texto transcrito na sessão atual.",
     )
-
-    can_index = transcription_result is not None or index_mode.startswith("1")
-
-    if index_mode.startswith("2") and not transcription_result:
-        st.info("Faça uma transcrição primeiro para habilitar a indexação individual.")
 
     if index_mode.startswith("1"):
         st.markdown(
