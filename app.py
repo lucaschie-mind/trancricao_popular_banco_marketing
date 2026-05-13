@@ -536,277 +536,232 @@ if transcription_result:
     elif not drive_url:
         st.info("Informe o link da pasta raiz do Drive para habilitar o salvamento.")
 
+
     # ── SECTION 5: Indexação no banco vetorial ─────────────────────────────────
-    st.divider()
-    st.subheader("🧠 Indexação no Banco Vetorial")
-
     db_url = get_secret("DATABASE_URL")
+    if db_url:
+        st.divider()
+        st.subheader("🧠 Indexação no Banco Vetorial")
 
-    if not db_url:
-        st.markdown(
-            '<div class="status-box status-warning">⚠️ <strong>DATABASE_URL</strong> não encontrada. '
-            'Configure a variável de ambiente para habilitar a indexação.</div>',
-            unsafe_allow_html=True,
-        )
-    else:
-    import hashlib
-    import time as _time
-
-    def get_pg_conn():
+        import hashlib
+        import time as _time
         import psycopg2
-        conn = psycopg2.connect(db_url)
-        conn.autocommit = True
-        return conn
-
-    def chunk_text(text: str, max_tokens: int = 500, overlap: int = 50) -> list[str]:
+        import psycopg2.extras as _pg_extras
         import tiktoken
-        enc    = tiktoken.get_encoding("cl100k_base")
-        tokens = enc.encode(text)
-        chunks = []
-        i = 0
-        while i < len(tokens):
-            chunk = enc.decode(tokens[i : i + max_tokens])
-            if chunk.strip():
-                chunks.append(chunk)
-            i += max_tokens - overlap
-        return chunks
 
-    def embed_text(text: str, oai_client) -> list[float]:
-        resp = oai_client.embeddings.create(model="text-embedding-ada-002", input=text)
-        return resp.data[0].embedding
+        def _get_pg_conn():
+            conn = psycopg2.connect(db_url)
+            conn.autocommit = True
+            return conn
 
-    def insert_chunks(cur, chunks: list[str], filename: str, folder: str,
-                      category: str, oai_client):
-        import psycopg2.extras as _extras
-        total = len(chunks)
-        for i, chunk in enumerate(chunks):
-            emb  = embed_text(chunk, oai_client)
-            meta = {
-                "arquivo":      filename,
-                "pasta":        folder,
-                "category":     category,
-                "chunk":        i,
-                "total":        total,
-                "content_hash": hashlib.md5(chunk.encode()).hexdigest(),
+        def _chunk_text(text, max_tokens=500, overlap=50):
+            enc = tiktoken.get_encoding("cl100k_base")
+            tokens = enc.encode(text)
+            chunks = []
+            i = 0
+            while i < len(tokens):
+                chunk = enc.decode(tokens[i:i + max_tokens])
+                if chunk.strip():
+                    chunks.append(chunk)
+                i += max_tokens - overlap
+            return chunks
+
+        def _embed(text, oai_client):
+            resp = oai_client.embeddings.create(model="text-embedding-ada-002", input=text)
+            return resp.data[0].embedding
+
+        def _insert_chunks(cur, chunks, filename, folder, category, oai_client):
+            for i, chunk in enumerate(chunks):
+                emb  = _embed(chunk, oai_client)
+                meta = {
+                    "arquivo":      filename,
+                    "pasta":        folder,
+                    "category":     category,
+                    "chunk":        i,
+                    "total":        len(chunks),
+                    "content_hash": hashlib.md5(chunk.encode()).hexdigest(),
+                }
+                cur.execute(
+                    "INSERT INTO documentos (conteudo, metadata, embedding) VALUES (%s, %s, %s::vector)",
+                    (chunk, _pg_extras.Json(meta), str(emb)),
+                )
+                _time.sleep(0.05)
+
+        def _category_from_folder(folder):
+            if not folder:
+                return "transcricoes"
+            first = folder.strip("/").split("/")[0].lower()
+            mapping = {
+                "brand": "brand", "marca": "brand",
+                "modulo": "modulos", "módulo": "modulos",
+                "persona": "personas", "case": "cases",
+                "conteudo": "conteudos", "conteúdo": "conteudos",
+                "transcri": "transcricoes",
             }
-            cur.execute(
-                "INSERT INTO documentos (conteudo, metadata, embedding) "
-                "VALUES (%s, %s, %s::vector)",
-                (chunk, _extras.Json(meta), str(emb)),
+            for key, val in mapping.items():
+                if key in first:
+                    return val
+            return "geral"
+
+        def _ingest_drive(drive_svc, folder_id, oai_client, status_ph, folder_name=""):
+            import io as _io
+            from googleapiclient.http import MediaIoBaseDownload
+            try:
+                import docx as _docx
+            except ImportError:
+                _docx = None
+            try:
+                from pypdf import PdfReader
+            except ImportError:
+                PdfReader = None
+
+            SUPPORTED = {
+                "application/vnd.google-apps.document",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "application/pdf", "text/plain", "text/markdown",
+            }
+
+            def _list(fid, fname):
+                resp = drive_svc.files().list(
+                    q=f"\'{fid}\' in parents and trashed=false",
+                    fields="files(id,name,mimeType)", pageSize=200,
+                ).execute()
+                result = []
+                for f in resp.get("files", []):
+                    if f["mimeType"] == "application/vnd.google-apps.folder":
+                        result += _list(f["id"], fname + "/" + f["name"])
+                    elif f["mimeType"] in SUPPORTED:
+                        result.append({**f, "folder": fname})
+                return result
+
+            def _download(file_id, mime_type):
+                if mime_type == "application/vnd.google-apps.document":
+                    resp = drive_svc.files().export(fileId=file_id, mimeType="text/plain").execute()
+                    return resp.decode("utf-8") if isinstance(resp, bytes) else resp
+                req = drive_svc.files().get_media(fileId=file_id)
+                buf = _io.BytesIO()
+                dl  = MediaIoBaseDownload(buf, req)
+                done = False
+                while not done:
+                    _, done = dl.next_chunk()
+                buf.seek(0)
+                return buf.read()
+
+            def _extract(content, mime_type, name):
+                try:
+                    if mime_type in ("application/vnd.google-apps.document", "text/plain", "text/markdown"):
+                        return content if isinstance(content, str) else content.decode("utf-8", errors="ignore")
+                    if mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+                        if _docx:
+                            doc = _docx.Document(_io.BytesIO(content))
+                            return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+                    if mime_type == "application/pdf":
+                        if PdfReader:
+                            reader = PdfReader(_io.BytesIO(content))
+                            return "\n\n".join(page.extract_text() or "" for page in reader.pages)
+                except Exception as e:
+                    status_ph.warning(f"⚠️ {name}: {e}")
+                return ""
+
+            files = _list(folder_id, folder_name)
+            status_ph.markdown(
+                f'<div class="chunk-progress">📁 {len(files)} arquivo(s) encontrado(s)…</div>',
+                unsafe_allow_html=True,
             )
-            _time.sleep(0.05)
-
-    def category_from_folder(folder: str) -> str:
-        if not folder:
-            return "transcricoes"
-        first = folder.strip("/").split("/")[0].lower()
-        mapping = {
-            "brand": "brand",       "marca": "brand",
-            "modulo": "modulos",    "módulo": "modulos",
-            "persona": "personas",  "case": "cases",
-            "conteudo": "conteudos","conteúdo": "conteudos",
-            "transcri": "transcricoes",
-        }
-        for key, val in mapping.items():
-            if key in first:
-                return val
-        return "geral"
-
-    def ingest_drive_folder(drive_svc, folder_id: str, oai_client,
-                             status_ph, folder_name: str = "") -> int:
-        """Recursively ingest all supported files from a Drive folder."""
-        import io as _io
-        from googleapiclient.http import MediaIoBaseDownload
-        try:
-            import docx as _docx
-        except ImportError:
-            _docx = None
-        try:
-            from pypdf import PdfReader
-        except ImportError:
-            PdfReader = None
-
-        SUPPORTED = {
-            "application/vnd.google-apps.document",
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            "application/pdf", "text/plain", "text/markdown",
-        }
-
-        def _list(fid, fname):
-            resp = drive_svc.files().list(
-                q=f"'{fid}' in parents and trashed=false",
-                fields="files(id,name,mimeType)", pageSize=200,
-            ).execute()
-            files = []
-            for f in resp.get("files", []):
-                if f["mimeType"] == "application/vnd.google-apps.folder":
-                    files += _list(f["id"], fname + "/" + f["name"])
-                elif f["mimeType"] in SUPPORTED:
-                    files.append({**f, "folder": fname})
-            return files
-
-        def _download(file_id, mime_type):
-            if mime_type == "application/vnd.google-apps.document":
-                resp = drive_svc.files().export(fileId=file_id, mimeType="text/plain").execute()
-                return resp.decode("utf-8") if isinstance(resp, bytes) else resp
-            req = drive_svc.files().get_media(fileId=file_id)
-            buf = _io.BytesIO()
-            dl  = MediaIoBaseDownload(buf, req)
-            done = False
-            while not done:
-                _, done = dl.next_chunk()
-            buf.seek(0)
-            return buf.read()
-
-        def _extract(content, mime_type, name):
-            try:
-                if mime_type in ("application/vnd.google-apps.document", "text/plain", "text/markdown"):
-                    return content if isinstance(content, str) else content.decode("utf-8", errors="ignore")
-                if mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-                    if _docx:
-                        doc = _docx.Document(_io.BytesIO(content))
-                        return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
-                if mime_type == "application/pdf":
-                    if PdfReader:
-                        reader = PdfReader(_io.BytesIO(content))
-                        return "\n\n".join(page.extract_text() or "" for page in reader.pages)
-            except Exception as e:
-                status_ph.warning(f"⚠️ {name}: {e}")
-            return ""
-
-        files = _list(folder_id, folder_name)
-        status_ph.markdown(
-            f'<div class="chunk-progress">📁 {len(files)} arquivo(s) encontrado(s) no Drive…</div>',
-            unsafe_allow_html=True,
-        )
-
-        conn = get_pg_conn()
-        cur  = conn.cursor()
-        total_chunks = 0
-
-        for f in files:
-            try:
-                status_ph.markdown(
-                    f'<div class="chunk-progress">📄 Processando: {f["folder"]}/{f["name"]}</div>',
-                    unsafe_allow_html=True,
-                )
-                raw  = _download(f["id"], f["mimeType"])
-                text = _extract(raw, f["mimeType"], f["name"])
-                if not text.strip():
-                    continue
-                chunks   = chunk_text(text)
-                category = category_from_folder(f["folder"])
-                insert_chunks(cur, chunks, f["name"], f["folder"], category, oai_client)
-                total_chunks += len(chunks)
-            except Exception as e:
-                status_ph.warning(f"❌ {f['name']}: {e}")
-
-        cur.close()
-        conn.close()
-        return total_chunks
-
-    # ── UI da seção — só aparece se já há transcrição ou usuário quer reindexar tudo ──
-    if not transcription_result:
-        st.info("Faça uma transcrição primeiro para habilitar a indexação.")
-        st.stop()
-
-    index_mode = st.radio(
-        "Modo de indexação",
-        options=[
-            "1 — Reindexar todo o repositório (limpa o banco e reindexa tudo do Drive)",
-            "2 — Indexar apenas esta transcrição (adiciona ao banco sem limpar)",
-        ],
-        index=1,
-        help="Opção 1 zera a tabela `documentos` e reindexa todos os arquivos da pasta raiz do Drive. "
-             "Opção 2 insere apenas o texto transcrito na sessão atual.",
-    )
-
-    if index_mode.startswith("1"):
-        st.markdown(
-            '<div class="status-box status-warning">'
-            '⚠️ <strong>Atenção:</strong> esta opção apaga todos os registros da tabela '
-            '<code>documentos</code> antes de reinserir. A operação é irreversível.'
-            '</div>',
-            unsafe_allow_html=True,
-        )
-
-    btn_label = (
-        "🔄  Reindexar repositório completo"
-        if index_mode.startswith("1")
-        else "➕  Indexar esta transcrição"
-    )
-
-    if st.button(btn_label, disabled=(index_mode.startswith("2") and not transcription_result)):
-        oai_client, oai_err = build_openai_client()
-        if oai_err:
-            st.error(f"OpenAI: {oai_err}")
-            st.stop()
-
-        idx_status = st.empty()
-
-        try:
-            conn = get_pg_conn()
+            conn = _get_pg_conn()
             cur  = conn.cursor()
+            total = 0
+            for f in files:
+                try:
+                    status_ph.markdown(
+                        f'<div class="chunk-progress">📄 {f["folder"]}/{f["name"]}</div>',
+                        unsafe_allow_html=True,
+                    )
+                    raw  = _download(f["id"], f["mimeType"])
+                    text = _extract(raw, f["mimeType"], f["name"])
+                    if not text.strip():
+                        continue
+                    chunks   = _chunk_text(text)
+                    category = _category_from_folder(f["folder"])
+                    _insert_chunks(cur, chunks, f["name"], f["folder"], category, oai_client)
+                    total += len(chunks)
+                except Exception as e:
+                    status_ph.warning(f"❌ {f['name']}: {e}")
+            cur.close()
+            conn.close()
+            return total
 
-            # ── Opção 1: limpar e reindexa tudo ───────────────────────────────
-            if index_mode.startswith("1"):
-                if not drive_service:
-                    st.error("Drive não autenticado. Necessário para reindexa completa.")
-                    st.stop()
-                if not drive_url:
-                    st.error("Informe o link da pasta raiz do Drive.")
-                    st.stop()
+        # UI
+        index_mode = st.radio(
+            "Modo de indexação",
+            options=[
+                "1 — Reindexar todo o repositório (limpa o banco e reindexa tudo do Drive)",
+                "2 — Indexar apenas esta transcrição (adiciona ao banco sem limpar)",
+            ],
+            index=1,
+        )
 
-                idx_status.markdown(
-                    '<div class="chunk-progress">🗑️ Limpando tabela documentos…</div>',
-                    unsafe_allow_html=True,
-                )
-                cur.execute("DELETE FROM documentos;")
+        if index_mode.startswith("1"):
+            st.markdown(
+                '<div class="status-box status-warning">'
+                '⚠️ <strong>Atenção:</strong> apaga todos os registros da tabela '
+                '<code>documentos</code> antes de reinserir. Operação irreversível.'
+                '</div>',
+                unsafe_allow_html=True,
+            )
 
-                cur.close()
-                conn.close()
+        btn_label = "🔄  Reindexar repositório completo" if index_mode.startswith("1") else "➕  Indexar esta transcrição"
+        btn_disabled = index_mode.startswith("2") and not transcription_result
 
-                root_folder_id = extract_folder_id(drive_url)
-                total = ingest_drive_folder(
-                    drive_service, root_folder_id, oai_client,
-                    idx_status, folder_name="",
-                )
+        if not transcription_result and index_mode.startswith("2"):
+            st.info("Faça uma transcrição primeiro para habilitar a indexação individual.")
 
-                idx_status.empty()
-                st.markdown(
-                    f'<div class="status-box status-success">'
-                    f'✅ Reindexação concluída — <strong>{total}</strong> chunks inseridos.'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
+        if st.button(btn_label, disabled=btn_disabled):
+            oai_client, oai_err = build_openai_client()
+            if oai_err:
+                st.error(f"OpenAI: {oai_err}")
+                st.stop()
 
-            # ── Opção 2: só esta transcrição ──────────────────────────────────
-            else:
-                filename = transcription_filename or "transcricao.txt"
-                folder   = selected_folder_name or ""
-                category = category_from_folder(folder)
-                chunks   = chunk_text(transcription_result)
-
-                idx_status.markdown(
-                    f'<div class="chunk-progress">'
-                    f'⚙️ Gerando embeddings para {len(chunks)} chunk(s)…'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-
-                insert_chunks(cur, chunks, filename, folder, category, oai_client)
-                cur.close()
-                conn.close()
-
-                idx_status.empty()
-                st.markdown(
-                    f'<div class="status-box status-success">'
-                    f'✅ Indexado — <strong>{len(chunks)}</strong> chunk(s) inseridos '
-                    f'na categoria <strong>{category}</strong>.'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-
-        except Exception as e:
-            idx_status.empty()
-            st.error(f"Erro na indexação: {e}")
+            idx_ph = st.empty()
+            try:
+                if index_mode.startswith("1"):
+                    if not drive_service:
+                        st.error("Drive não autenticado.")
+                        st.stop()
+                    if not drive_url:
+                        st.error("Informe o link da pasta raiz do Drive.")
+                        st.stop()
+                    conn = _get_pg_conn()
+                    cur  = conn.cursor()
+                    idx_ph.markdown('<div class="chunk-progress">🗑️ Limpando tabela…</div>', unsafe_allow_html=True)
+                    cur.execute("DELETE FROM documentos;")
+                    cur.close()
+                    conn.close()
+                    total = _ingest_drive(drive_service, extract_folder_id(drive_url), oai_client, idx_ph)
+                    idx_ph.empty()
+                    st.markdown(
+                        f'<div class="status-box status-success">✅ Reindexação concluída — <strong>{total}</strong> chunks inseridos.</div>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    filename = transcription_filename or "transcricao.txt"
+                    folder   = selected_folder_name or ""
+                    category = _category_from_folder(folder)
+                    chunks   = _chunk_text(transcription_result)
+                    idx_ph.markdown(
+                        f'<div class="chunk-progress">⚙️ Gerando embeddings para {len(chunks)} chunk(s)…</div>',
+                        unsafe_allow_html=True,
+                    )
+                    conn = _get_pg_conn()
+                    cur  = conn.cursor()
+                    _insert_chunks(cur, chunks, filename, folder, category, oai_client)
+                    cur.close()
+                    conn.close()
+                    idx_ph.empty()
+                    st.markdown(
+                        f'<div class="status-box status-success">✅ Indexado — <strong>{len(chunks)}</strong> chunk(s) na categoria <strong>{category}</strong>.</div>',
+                        unsafe_allow_html=True,
+                    )
+            except Exception as e:
+                idx_ph.empty()
+                st.error(f"Erro na indexação: {e}")
