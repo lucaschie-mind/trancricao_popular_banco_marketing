@@ -15,6 +15,14 @@ st.set_page_config(
     layout="centered",
 )
 
+# Allow uploads up to 1 GB
+# This is also set in .streamlit/config.toml — both are needed
+try:
+    from streamlit import config as _st_config
+    _st_config.set_option("server.maxUploadSize", 1024)
+except Exception:
+    pass
+
 # ── Custom CSS ─────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
@@ -195,6 +203,16 @@ def list_subfolders(service, parent_id: str):
     return [(f["name"], f["id"]) for f in result.get("files", [])]
 
 
+def list_all_folders_flat(service, parent_id: str, prefix: str = "") -> list:
+    """Recursively list all folders. Returns [(label, id)] with hierarchy in label."""
+    results = []
+    for name, fid in list_subfolders(service, parent_id):
+        label = f"{prefix} / {name}" if prefix else name
+        results.append((label, fid))
+        results.extend(list_all_folders_flat(service, fid, prefix=label))
+    return results
+
+
 def upload_to_drive(service, file_bytes: bytes, filename: str, folder_id: str, mime_type: str = "text/plain"):
     from googleapiclient.http import MediaIoBaseUpload
     import io
@@ -356,29 +374,29 @@ if drive_error:
 
 if drive_url and drive_service:
     root_id = extract_folder_id(drive_url)
-    with st.spinner("Buscando subpastas…"):
+    with st.spinner("Buscando pastas…"):
         try:
-            subfolders = list_subfolders(drive_service, root_id)
+            all_folders = list_all_folders_flat(drive_service, root_id)
         except Exception as e:
             st.error(f"Erro ao listar pastas: {e}")
-            subfolders = []
+            all_folders = []
 
-    if subfolders:
-        folder_options       = {name: fid for name, fid in subfolders}
-        folder_choice        = st.selectbox("Salvar na pasta", options=list(folder_options.keys()))
-        selected_folder_id   = folder_options[folder_choice]
-        selected_folder_name = folder_choice
-        st.markdown(
-            f'<div class="status-box status-info">📂 Destino: <strong>{folder_choice}</strong></div>',
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown(
-            '<div class="status-box status-warning">Nenhuma subpasta encontrada — arquivo salvo na pasta raiz.</div>',
-            unsafe_allow_html=True,
-        )
-        selected_folder_id   = root_id
-        selected_folder_name = "pasta raiz"
+    # Always include the root folder as first option
+    folder_options = {"📁 (pasta raiz)": root_id}
+    for name, fid in all_folders:
+        folder_options[name] = fid
+
+    folder_choice        = st.selectbox(
+        "Salvar na pasta",
+        options=list(folder_options.keys()),
+        help="Escolha qualquer pasta ou subpasta dentro da pasta raiz.",
+    )
+    selected_folder_id   = folder_options[folder_choice]
+    selected_folder_name = folder_choice
+    st.markdown(
+        f'<div class="status-box status-info">📂 Destino: <strong>{folder_choice}</strong></div>',
+        unsafe_allow_html=True,
+    )
 
 elif drive_url and not drive_service:
     st.info("Configure as credenciais do Google Drive nos secrets para habilitar o salvamento.")
@@ -397,7 +415,7 @@ ALLOWED_EXTENSIONS = [
 uploaded_file = st.file_uploader(
     "Selecione o arquivo de vídeo ou áudio",
     type=ALLOWED_EXTENSIONS,
-    help=f"Formatos aceitos: {', '.join(ALLOWED_EXTENSIONS)}",
+    help=f"Formatos aceitos: {', '.join(ALLOWED_EXTENSIONS)} · Tamanho máximo: 1 GB",
 )
 
 if uploaded_file:
@@ -405,7 +423,9 @@ if uploaded_file:
     with col1:
         st.markdown(f"**Nome:** `{uploaded_file.name}`")
     with col2:
-        st.markdown(f"**Tamanho:** `{uploaded_file.size / (1024*1024):.1f} MB`")
+        size_mb = uploaded_file.size / (1024 * 1024)
+        size_str = f"{size_mb / 1024:.2f} GB" if size_mb > 1024 else f"{size_mb:.1f} MB"
+        st.markdown(f"**Tamanho:** `{size_str}`")
 
 st.divider()
 
