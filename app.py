@@ -228,13 +228,19 @@ def get_drive_service():
 
 
 def list_subfolders(service, parent_id: str):
+    """Return direct subfolders. Supports both personal and Shared Drives."""
     query = (
         f"'{parent_id}' in parents "
         "and mimeType='application/vnd.google-apps.folder' "
         "and trashed=false"
     )
     result = service.files().list(
-        q=query, fields="files(id, name)", orderBy="name"
+        q=query,
+        fields="files(id, name)",
+        orderBy="name",
+        includeItemsFromAllDrives=True,
+        supportsAllDrives=True,
+        corpora="allDrives",
     ).execute()
     return [(f["name"], f["id"]) for f in result.get("files", [])]
 
@@ -255,9 +261,17 @@ def upload_to_drive(service, file_bytes: bytes, filename: str, folder_id: str, m
     media    = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=True)
     metadata = {"name": filename, "parents": [folder_id]}
     uploaded = service.files().create(
-        body=metadata, media_body=media, fields="id, webViewLink"
+        body=metadata,
+        media_body=media,
+        fields="id, webViewLink",
+        supportsAllDrives=True,
     ).execute()
-    return uploaded.get("webViewLink", "")
+    link = uploaded.get("webViewLink", "")
+    # If no webViewLink (common with service accounts on personal drives),
+    # build the URL manually from the file id
+    if not link and uploaded.get("id"):
+        link = f"https://drive.google.com/file/d/{uploaded['id']}/view"
+    return link
 
 
 # ── Helpers: ffmpeg + OpenAI Whisper API ───────────────────────────────────────
@@ -680,7 +694,11 @@ if transcription_result:
             def _list(fid, fname):
                 resp = drive_svc.files().list(
                     q=f"\'{fid}\' in parents and trashed=false",
-                    fields="files(id,name,mimeType)", pageSize=200,
+                    fields="files(id,name,mimeType)",
+                    pageSize=200,
+                    includeItemsFromAllDrives=True,
+                    supportsAllDrives=True,
+                    corpora="allDrives",
                 ).execute()
                 result = []
                 for f in resp.get("files", []):
@@ -694,7 +712,7 @@ if transcription_result:
                 if mime_type == "application/vnd.google-apps.document":
                     resp = drive_svc.files().export(fileId=file_id, mimeType="text/plain").execute()
                     return resp.decode("utf-8") if isinstance(resp, bytes) else resp
-                req = drive_svc.files().get_media(fileId=file_id)
+                req = drive_svc.files().get_media(fileId=file_id, supportsAllDrives=True)
                 buf = _io.BytesIO()
                 dl  = MediaIoBaseDownload(buf, req)
                 done = False
